@@ -101,6 +101,8 @@ def build_html(
   .legend{display:flex;gap:10px;flex-wrap:wrap;margin-top:6px}
   .dot{width:12px;height:12px;border-radius:3px;display:inline-block}
   .pill{display:inline-block;background:#111827;border:1px solid #374151;border-radius:999px;padding:2px 8px;margin:2px 4px 2px 0;font-size:.8rem}
+  .pill-tmp{background:#064e3b;border-color:#10b981;color:#a7f3d0}
+  .tmpSummary{background:#111827;border:1px solid #1f2937;border-radius:10px;padding:8px 10px;margin:10px 0;font-size:.9rem}
   .muted{color:#9ca3af}
 </style>
 </head>
@@ -274,33 +276,57 @@ applyMode(); applyOnlyTmp(); applyEdgeLabels();
 const sideTitle=document.getElementById('sideTitle');
 const meta=document.getElementById('meta');
 
+function tmpBadgeFor(id){
+  const el = cy.getElementById(id);
+  if(el && el.length && el.data('isTmp')){
+    return ' <span class="pill pill-tmp">TMP</span>';
+  }
+  return '';
+}
+
 function renderDetails(id){
   const mode = modeSel.value;
+  const node = cy.getElementById(id);
+  const isTmpNode = !!(node && node.length && node.data('isTmp'));
   let inc = [], out = [];
   if(mode==='lineage'){ inc = IN_L[id] || []; out = OUT_L[id] || []; }
   else                { inc = IN_P[id] || []; out = OUT_P[id] || []; }
 
   let html='';
+  if(mode==='lineage' && isTmpNode){
+    const tmpUsages = out.filter(row => {
+      const target = row[0];
+      const targetEl = cy.getElementById(target);
+      return targetEl && targetEl.length && targetEl.data('isTmp');
+    }).length;
+    const otherUsages = out.length - tmpUsages;
+    if(out.length){
+      html+=`<div class="tmpSummary">Utilizada en ${out.length} tabla(s): ${tmpUsages} temporales · ${otherUsages} permanentes.</div>`;
+    }else{
+      html+=`<div class="tmpSummary muted">Esta tabla temporal no es utilizada posteriormente.</div>`;
+    }
+  }
   html+=`<h4>Entrantes (${inc.length})</h4>`;
   if(inc.length===0) html+=`<div class="muted">—</div>`;
   inc.forEach(row => {
     if(mode==='lineage'){
       const [src,j,op,f]=row;
-      html+=`<div class="pill">${j}</div> ${src} <span class="muted">· ${op} @ ${f}</span><br/>`;
+      html+=`<div class="pill">${j}</div> ${src}${tmpBadgeFor(src)} <span class="muted">· ${op} @ ${f}</span><br/>`;
     }else{
       const [src,j,f]=row;
-      html+=`<div class="pill">${j}</div> ${src} <span class="muted">· ${f}</span><br/>`;
+      html+=`<div class="pill">${j}</div> ${src}${tmpBadgeFor(src)} <span class="muted">· ${f}</span><br/>`;
     }
   });
-  html+=`<h4 style="margin-top:.8rem">Salientes (${out.length})</h4>`;
+  const outTitle = (mode==='lineage' && isTmpNode) ? 'Utilizado en' : 'Salientes';
+  html+=`<h4 style="margin-top:.8rem">${outTitle} (${out.length})</h4>`;
   if(out.length===0) html+=`<div class="muted">—</div>`;
   out.forEach(row => {
     if(mode==='lineage'){
       const [dst,j,op,f]=row;
-      html+=`<div class="pill">${j}</div> ${dst} <span class="muted">· ${op} @ ${f}</span><br/>`;
+      html+=`<div class="pill">${j}</div> ${dst}${tmpBadgeFor(dst)} <span class="muted">· ${op} @ ${f}</span><br/>`;
     }else{
       const [dst,j,f]=row;
-      html+=`<div class="pill">${j}</div> ${dst} <span class="muted">· ${f}</span><br/>`;
+      html+=`<div class="pill">${j}</div> ${dst}${tmpBadgeFor(dst)} <span class="muted">· ${f}</span><br/>`;
     }
   });
   meta.innerHTML = html;
