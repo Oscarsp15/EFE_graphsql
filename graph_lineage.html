@@ -1,0 +1,533 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8" />
+  <title>Lineage DAG</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <style>
+    :root {
+      color-scheme: dark;
+      font-family: "Inter", system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background-color: #0f172a;
+      color: #f9fafb;
+    }
+
+    body {
+      margin: 0;
+      display: flex;
+      flex-direction: column;
+      min-height: 100vh;
+      background-color: #0f172a;
+    }
+
+    header {
+      padding: 16px;
+      background: #111827;
+      border-bottom: 1px solid #1f2937;
+    }
+
+    .toolbar {
+      display: flex;
+      gap: 12px;
+      align-items: center;
+    }
+
+    .toolbar button {
+      padding: 8px 14px;
+      border-radius: 6px;
+      border: 1px solid #1f2937;
+      background: #1f2937;
+      color: #f9fafb;
+      font-size: 14px;
+      cursor: pointer;
+      transition: background 0.2s ease, transform 0.2s ease;
+    }
+
+    .toolbar button:hover {
+      background: #374151;
+      transform: translateY(-1px);
+    }
+
+    .layout {
+      flex: 1;
+      display: flex;
+      overflow: hidden;
+    }
+
+    #cy {
+      flex: 1 1 auto;
+      height: 100%;
+      background: #0f172a;
+    }
+
+    aside {
+      width: 320px;
+      max-width: 320px;
+      padding: 20px;
+      background: #111827;
+      border-left: 1px solid #1f2937;
+      overflow-y: auto;
+    }
+
+    aside h2 {
+      font-size: 18px;
+      margin-top: 0;
+      margin-bottom: 12px;
+      color: #f9fafb;
+    }
+
+    .chips {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-bottom: 16px;
+    }
+
+    .chip {
+      padding: 4px 10px;
+      border-radius: 999px;
+      background: #1f2937;
+      border: 1px solid #374151;
+      font-size: 12px;
+      color: #e5e7eb;
+    }
+
+    .section {
+      margin-bottom: 20px;
+    }
+
+    .section h3 {
+      font-size: 14px;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      color: #9ca3af;
+      margin: 0 0 8px;
+    }
+
+    ul.list {
+      list-style: none;
+      padding: 0;
+      margin: 0;
+      display: grid;
+      gap: 6px;
+    }
+
+    ul.list li {
+      background: #1f2937;
+      border: 1px solid #374151;
+      border-radius: 6px;
+      padding: 8px 10px;
+      font-size: 13px;
+      color: #e5e7eb;
+      line-height: 1.4;
+    }
+
+    .placeholder {
+      color: #6b7280;
+      font-size: 13px;
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="toolbar">
+      <button id="fit-btn">Fit</button>
+      <button id="layout-btn">Reaplicar layout</button>
+      <button id="toggle-labels-btn">Ocultar etiquetas de aristas</button>
+    </div>
+  </header>
+  <div class="layout">
+    <div id="cy"></div>
+    <aside id="info-panel">
+      <h2>Selecciona un nodo</h2>
+      <div class="chips"></div>
+      <div class="section">
+        <h3>Creación</h3>
+        <div class="placeholder">Selecciona una tabla temporal para ver sus fuentes.</div>
+      </div>
+      <div class="section">
+        <h3>Utilizado en</h3>
+        <div class="placeholder">Selecciona una tabla para ver sus consumidores.</div>
+      </div>
+    </aside>
+  </div>
+
+  <script src="https://unpkg.com/cytoscape@3.28.0/dist/cytoscape.min.js"></script>
+  <script src="https://unpkg.com/dagre@0.8.5/dist/dagre.min.js"></script>
+  <script src="https://unpkg.com/cytoscape-dagre@2.5.0/cytoscape-dagre.js"></script>
+  <script>
+    // --- Datos de nodos y aristas ---
+    const creationDetails = {
+      "PROD_MODELOS.DBO.TMPPERFILMOTOSRECURRENTE": {
+        from: "PROD_MODELOS.DBO.UMD_FED_DETALLEBASEMASIVAS",
+        joins: [
+          {
+            type: "LEFT JOIN",
+            target: "DBO.Reperfilado",
+            detail: "por NROORDEN"
+          }
+        ]
+      }
+      // DBO.Reperfilado no tiene detalles de creación en este contexto
+    };
+
+    const nodes = [
+      {
+        data: {
+          id: "PROD_MODELOS.DBO.UMD_FED_DETALLEBASEMASIVAS",
+          label: "PROD_MODELOS.DBO.UMD_FED_DETALLEBASEMASIVAS",
+          catalog: "PROD_MODELOS",
+          isTemporal: false
+        }
+      },
+      {
+        data: {
+          id: "PROD_MODELOS.DBO.TMPPERFILMOTOSRECURRENTE",
+          label: "PROD_MODELOS.DBO.TMPPERFILMOTOSRECURRENTE",
+          catalog: "PROD_MODELOS",
+          isTemporal: true
+        }
+      },
+      {
+        data: {
+          id: "DBO.Reperfilado",
+          label: "DBO.Reperfilado",
+          catalog: "DBO",
+          isTemporal: true,
+          forceTemporal: true
+        }
+      }
+    ].map((node) => {
+      const temporalByName = /tmp|temp/i.test(node.data.id);
+      const isTemporal = temporalByName || node.data.forceTemporal || node.data.isTemporal;
+      const classes = isTemporal ? "temporal" : "";
+      return {
+        data: {
+          ...node.data,
+          isTemporal
+        },
+        classes
+      };
+    });
+
+    const edges = [
+      {
+        data: {
+          id: "edge-from",
+          source: "PROD_MODELOS.DBO.UMD_FED_DETALLEBASEMASIVAS",
+          target: "PROD_MODELOS.DBO.TMPPERFILMOTOSRECURRENTE",
+          type: "FROM",
+          label: "FROM"
+        }
+      },
+      {
+        data: {
+          id: "edge-left-join",
+          source: "PROD_MODELOS.DBO.UMD_FED_DETALLEBASEMASIVAS",
+          target: "DBO.Reperfilado",
+          type: "LEFT_JOIN",
+          label: "LEFT JOIN por NROORDEN"
+        }
+      },
+      {
+        data: {
+          id: "edge-utilizado-en",
+          source: "PROD_MODELOS.DBO.TMPPERFILMOTOSRECURRENTE",
+          target: "DBO.Reperfilado",
+          type: "UTILIZADO_EN",
+          label: "UTILIZADO EN"
+        }
+      }
+    ];
+
+    // --- Inicialización de Cytoscape ---
+    cytoscape.use(cytoscapeDagre);
+
+    const cy = cytoscape({
+      container: document.getElementById("cy"),
+      elements: {
+        nodes,
+        edges
+      },
+      layout: getDagreLayoutOptions(),
+      style: [
+        {
+          selector: "node",
+          style: {
+            "shape": "round-rectangle",
+            "background-color": "#111827",
+            "border-width": 2,
+            "border-color": "#334155",
+            "color": "#ffffff",
+            "text-valign": "center",
+            "text-halign": "center",
+            "label": "data(label)",
+            "text-wrap": "wrap",
+            "text-max-width": 200,
+            "text-outline-width": 3,
+            "text-outline-color": "#0f172a",
+            "font-size": 12,
+            "padding": "12px",
+            "width": "label",
+            "height": "label"
+          }
+        },
+        {
+          selector: "node.temporal",
+          style: {
+            "background-color": "#1f2937",
+            "border-color": "#10b981",
+            "border-width": 3
+          }
+        },
+        {
+          selector: "edge",
+          style: {
+            "curve-style": "bezier",
+            "target-arrow-shape": "triangle",
+            "target-arrow-color": "#9ca3af",
+            "arrow-scale": 1.2,
+            "line-color": "#9ca3af",
+            "width": 1,
+            "label": "data(label)",
+            "font-size": 10,
+            "color": "#ffffff",
+            "text-background-color": "rgba(15, 23, 42, 0.85)",
+            "text-background-opacity": 1,
+            "text-background-padding": "4px",
+            "text-border-radius": "4px",
+            "text-rotation": "autorotate"
+          }
+        },
+        {
+          selector: 'edge[type = "FROM"]',
+          style: {
+            "line-color": "#9ca3af",
+            "target-arrow-color": "#9ca3af",
+            "width": 1
+          }
+        },
+        {
+          selector: 'edge[type = "LEFT_JOIN"]',
+          style: {
+            "line-color": "#059669",
+            "target-arrow-color": "#059669",
+            "width": 2,
+            "line-style": "dashed",
+            "line-dash-pattern": [6, 4]
+          }
+        },
+        {
+          selector: 'edge[type = "RIGHT_JOIN"]',
+          style: {
+            "line-color": "#d97706",
+            "target-arrow-color": "#d97706",
+            "width": 2,
+            "line-style": "dashed",
+            "line-dash-pattern": [2, 6]
+          }
+        },
+        {
+          selector: 'edge[type = "INNER_JOIN"]',
+          style: {
+            "line-color": "#2563eb",
+            "target-arrow-color": "#2563eb",
+            "width": 3,
+            "line-style": "solid"
+          }
+        },
+        {
+          selector: 'edge[type = "FULL_JOIN"]',
+          style: {
+            "line-color": "#dc2626",
+            "target-arrow-color": "#dc2626",
+            "width": 3,
+            "line-style": "dashed",
+            "line-dash-pattern": [1, 3]
+          }
+        },
+        {
+          selector: 'edge[type = "CROSS"]',
+          style: {
+            "line-color": "#7c3aed",
+            "target-arrow-color": "#7c3aed",
+            "width": 2,
+            "line-style": "dashed",
+            "line-dash-pattern": [8, 2]
+          }
+        },
+        {
+          selector: 'edge[type = "UTILIZADO_EN"]',
+          style: {
+            "line-color": "#a855f7",
+            "target-arrow-color": "#a855f7",
+            "width": 2,
+            "line-style": "dashed",
+            "line-dash-pattern": [2, 4]
+          }
+        },
+        {
+          selector: '.faded',
+          style: {
+            "opacity": 0.15
+          }
+        },
+        {
+          selector: '.hide-label',
+          style: {
+            "text-opacity": 0
+          }
+        }
+      ]
+    });
+
+    // --- Configuración de la barra de herramientas ---
+    document.getElementById("fit-btn").addEventListener("click", () => {
+      cy.fit();
+    });
+
+    document.getElementById("layout-btn").addEventListener("click", () => {
+      cy.layout(getDagreLayoutOptions()).run();
+    });
+
+    let labelsVisible = true;
+    document.getElementById("toggle-labels-btn").addEventListener("click", (event) => {
+      labelsVisible = !labelsVisible;
+      cy.edges().toggleClass("hide-label", !labelsVisible);
+      event.target.textContent = labelsVisible ? "Ocultar etiquetas de aristas" : "Mostrar etiquetas de aristas";
+    });
+
+    // --- Interacciones y panel lateral ---
+    cy.on("tap", "node", (evt) => {
+      const node = evt.target;
+      highlightNeighborhood(node);
+      updatePanel(node);
+    });
+
+    cy.on("tap", (evt) => {
+      if (evt.target === cy) {
+        clearHighlights();
+        resetPanel();
+      }
+    });
+
+    function getDagreLayoutOptions() {
+      return {
+        name: "dagre",
+        rankDir: "LR",
+        nodeSep: 80,
+        rankSep: 120,
+        edgeSep: 20,
+        fit: true,
+        padding: 30
+      };
+    }
+
+    function highlightNeighborhood(node) {
+      cy.elements().addClass("faded");
+      const neighborhood = node.closedNeighborhood();
+      neighborhood.removeClass("faded");
+    }
+
+    function clearHighlights() {
+      cy.elements().removeClass("faded");
+    }
+
+    function resetPanel() {
+      const panel = document.getElementById("info-panel");
+      panel.querySelector("h2").textContent = "Selecciona un nodo";
+      panel.querySelector(".chips").innerHTML = "";
+      const sections = panel.querySelectorAll(".section");
+      sections[0].querySelector(".placeholder")?.remove();
+      sections[0].innerHTML = '<h3>Creación</h3><div class="placeholder">Selecciona una tabla temporal para ver sus fuentes.</div>';
+      sections[1].querySelector(".placeholder")?.remove();
+      sections[1].innerHTML = '<h3>Utilizado en</h3><div class="placeholder">Selecciona una tabla para ver sus consumidores.</div>';
+    }
+
+    function updatePanel(node) {
+      const panel = document.getElementById("info-panel");
+      const data = node.data();
+      panel.querySelector("h2").textContent = data.label;
+
+      const chipsContainer = panel.querySelector(".chips");
+      chipsContainer.innerHTML = "";
+
+      const catalogChip = document.createElement("div");
+      catalogChip.className = "chip";
+      catalogChip.textContent = `Catálogo: ${data.catalog || "N/A"}`;
+      chipsContainer.appendChild(catalogChip);
+
+      const temporalChip = document.createElement("div");
+      temporalChip.className = "chip";
+      temporalChip.textContent = `TMP: ${data.isTemporal ? "Sí" : "No"}`;
+      chipsContainer.appendChild(temporalChip);
+
+      const sections = panel.querySelectorAll(".section");
+      const creationSection = sections[0];
+      const usageSection = sections[1];
+
+      creationSection.innerHTML = "<h3>Creación</h3>";
+      usageSection.innerHTML = "<h3>Utilizado en</h3>";
+
+      const details = creationDetails[data.id];
+      if (data.isTemporal && details) {
+        const list = document.createElement("ul");
+        list.className = "list";
+
+        if (details.from) {
+          const li = document.createElement("li");
+          li.textContent = `FROM → ${details.from}`;
+          list.appendChild(li);
+        }
+
+        if (Array.isArray(details.joins)) {
+          details.joins.forEach((join) => {
+            const li = document.createElement("li");
+            const detailSuffix = join.detail ? ` (${join.detail})` : "";
+            li.textContent = `${join.type} → ${join.target}${detailSuffix}`;
+            list.appendChild(li);
+          });
+        }
+
+        creationSection.appendChild(list);
+      } else if (data.isTemporal) {
+        const placeholder = document.createElement("div");
+        placeholder.className = "placeholder";
+        placeholder.textContent = "Sin detalles de creación registrados.";
+        creationSection.appendChild(placeholder);
+      } else {
+        const placeholder = document.createElement("div");
+        placeholder.className = "placeholder";
+        placeholder.textContent = "No aplica. Solo se muestran creaciones de temporales.";
+        creationSection.appendChild(placeholder);
+      }
+
+      const usageEdges = node.connectedEdges(function (edge) {
+        return edge.data("type") === "UTILIZADO_EN" && edge.source().id() === node.id();
+      });
+
+      if (usageEdges.length > 0) {
+        const list = document.createElement("ul");
+        list.className = "list";
+        usageEdges.forEach((edge) => {
+          const target = edge.target().data("label");
+          const li = document.createElement("li");
+          li.textContent = `UTILIZADO EN → ${target}`;
+          list.appendChild(li);
+        });
+        usageSection.appendChild(list);
+      } else {
+        const placeholder = document.createElement("div");
+        placeholder.className = "placeholder";
+        placeholder.textContent = "Sin consumidores registrados.";
+        usageSection.appendChild(placeholder);
+      }
+    }
+
+    // Ajustar vista inicial
+    cy.ready(() => {
+      cy.fit();
+    });
+  </script>
+</body>
+</html>
