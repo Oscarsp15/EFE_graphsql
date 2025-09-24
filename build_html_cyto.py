@@ -1,362 +1,564 @@
 # -*- coding: utf-8 -*-
-"""
-build_html_cyto.py
-Cytoscape.js con:
-- Temporales: verde (#22c55e), No temporales: gris (#64748b)
-- Modo: Linaje (source->target) vs Pares JOIN (FROM->JOIN)
-- Etiquetas de arista (LEFT/RIGHT/INNER/FROM, texto blanco con halo)
-- Panel lateral, búsqueda, filtro "Solo temporales"
-- Guardar/cargar posiciones
-"""
+"""HTML builder for the Cytoscape.js lineage graph."""
+from __future__ import annotations
 
 import json
-import re
-from typing import Set, List, Tuple, Dict
+from typing import Sequence
 
-def is_tmp(name: str) -> bool:
-    return bool(re.search(r"\b(TMP|TEMP)\b", name, flags=re.IGNORECASE))
 
-def build_html(
-    nodes: Set[str],
-    edges_lineage: List[Tuple[str, str, str, str, str]],
-    edges_pairs:   List[Tuple[str, str, str, str]],
-    title: str
-) -> str:
-
-    # Nodos (verde si temporal, gris si no)
-    cy_nodes = []
-    for n in sorted(nodes):
-        cy_nodes.append({
-            "data": {
-                "id": n,
-                "label": n,
-                "isTmp": is_tmp(n),
-                "color": "#22c55e" if is_tmp(n) else "#64748b"  # verde / gris
-            },
-            "classes": "tmp" if is_tmp(n) else "base"
-        })
-
-    # Aristas de linaje (source -> target)
-    def join_class(j: str) -> str:
-        j = (j or "").lower()
-        if j.startswith("from"):  return "join-from"
-        if j.startswith("left"):  return "join-left"
-        if j.startswith("right"): return "join-right"
-        if j.startswith("full"):  return "join-full"
-        if j.startswith("inner"): return "join-inner"
-        if j.startswith("cross"): return "join-cross"
-        return "join-plain"
-
-    cy_edges = []
-    incomingL: Dict[str, List] = {}
-    outgoingL: Dict[str, List] = {}
-    for s, t, op, f, jtype in edges_lineage:
-        eid = f"L::{s}=>{t}::{jtype}::{op}::{f}"
-        lbl = (jtype or "").upper()
-        cy_edges.append({
-            "data": {
-                "id": eid, "source": s, "target": t,
-                "kind": "lineage",
-                "join": lbl, "op": op, "file": f,
-                "showLabel": lbl
-            },
-            "classes": f"etype-lineage {join_class(lbl)}"
-        })
-        incomingL.setdefault(t, []).append((s, lbl, op, f))
-        outgoingL.setdefault(s, []).append((t, lbl, op, f))
-
-    # Aristas de pares (FROM -> JOIN de la MISMA sentencia)
-    incomingP: Dict[str, List] = {}
-    outgoingP: Dict[str, List] = {}
-    for a, b, jtype, f in edges_pairs:
-        eid = f"P::{a}=>{b}::{jtype}::{f}"
-        lbl = (jtype or "").upper()
-        cy_edges.append({
-            "data": {
-                "id": eid, "source": a, "target": b,
-                "kind": "pair",
-                "join": lbl, "file": f,
-                "showLabel": lbl
-            },
-            "classes": f"etype-pair {join_class(lbl)}"
-        })
-        incomingP.setdefault(b, []).append((a, lbl, f))
-        outgoingP.setdefault(a, []).append((b, lbl, f))
-
-    template = """<!doctype html>
-<html>
+HTML_TEMPLATE = """<!DOCTYPE html>
+<html lang=\"es\">
 <head>
-<meta charset="utf-8"/>
+<meta charset=\"utf-8\" />
 <title>__TITLE__</title>
-<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\" />
 <style>
-  body{background:#0b1220;color:#e5e7eb;font-family:ui-sans-serif,system-ui,-apple-system,Segoe UI,Inter}
-  .toolbar{display:flex;flex-wrap:wrap;gap:10px;align-items:center;padding:10px;border-bottom:1px solid #223;position:sticky;top:0;background:#0b1220;z-index:9}
-  input,button,select,label{color:#e5e7eb}
-  input,select{background:#0f172a;border:1px solid #334155;border-radius:8px;padding:8px 10px}
-  button{background:#0f172a;border:1px solid #334155;border-radius:8px;padding:8px 12px;cursor:pointer}
-  #layoutRow{display:flex}
-  #cy{height:calc(100vh - 72px);flex:1}
-  #side{width:380px;border-left:1px solid #223;padding:10px;overflow:auto}
-  .legend{display:flex;gap:10px;flex-wrap:wrap;margin-top:6px}
-  .dot{width:12px;height:12px;border-radius:3px;display:inline-block}
-  .pill{display:inline-block;background:#111827;border:1px solid #374151;border-radius:999px;padding:2px 8px;margin:2px 4px 2px 0;font-size:.8rem}
-  .pill-tmp{background:#064e3b;border-color:#10b981;color:#a7f3d0}
-  .tmpSummary{background:#111827;border:1px solid #1f2937;border-radius:10px;padding:8px 10px;margin:10px 0;font-size:.9rem}
-  .muted{color:#9ca3af}
+body {
+  background:#111827;
+  color:#e5e7eb;
+  font-family:'Inter',system-ui,-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
+  margin:0;
+}
+header {
+  border-bottom:1px solid #1f2937;
+  background:#0f172a;
+  position:sticky;
+  top:0;
+  z-index:10;
+}
+.toolbar {
+  display:flex;
+  flex-wrap:wrap;
+  gap:0.5rem;
+  padding:0.75rem 1rem;
+  align-items:center;
+}
+.toolbar h1 {
+  font-size:1.1rem;
+  margin:0 1rem 0 0;
+}
+.toolbar input,
+.toolbar select,
+.toolbar button,
+.toolbar label {
+  font-size:0.9rem;
+  color:#e5e7eb;
+}
+.toolbar input,
+.toolbar select {
+  background:#1f2937;
+  border:1px solid #334155;
+  border-radius:0.5rem;
+  padding:0.45rem 0.6rem;
+}
+.toolbar button {
+  background:#1f2937;
+  border:1px solid #334155;
+  border-radius:0.5rem;
+  padding:0.45rem 0.75rem;
+  cursor:pointer;
+}
+main {
+  display:flex;
+  min-height:calc(100vh - 4.5rem);
+}
+#cy {
+  flex:1;
+  height:calc(100vh - 4.5rem);
+}
+#sidebar {
+  width:360px;
+  max-width:100%;
+  border-left:1px solid #1f2937;
+  background:#0f172a;
+  padding:1rem;
+  overflow-y:auto;
+}
+.section {
+  margin-bottom:1.5rem;
+}
+.section h2 {
+  font-size:1rem;
+  margin:0 0 0.5rem 0;
+}
+.badge {
+  display:inline-block;
+  background:#1f2937;
+  border-radius:999px;
+  padding:0.15rem 0.6rem;
+  margin-right:0.5rem;
+  font-size:0.8rem;
+  border:1px solid #334155;
+}
+.badge.tmp {
+  border-color:#10b981;
+  color:#6ee7b7;
+}
+.list {
+  list-style:none;
+  padding:0;
+  margin:0;
+}
+.list li {
+  margin-bottom:0.35rem;
+}
+.muted {
+  color:#9ca3af;
+  font-size:0.85rem;
+}
+.edge-label-toggle {
+  margin-left:0.5rem;
+}
 </style>
 </head>
 <body>
-<div class="toolbar">
-  <strong>__TITLE__</strong>
-  <select id="mode">
-    <option value="lineage" selected>Modo: Linaje (creación)</option>
-    <option value="pairs">Modo: Pares JOIN (FROM → JOIN)</option>
-  </select>
-  <label><input type="checkbox" id="onlyTmp"> Solo temporales</label>
-  <label><input type="checkbox" id="edgeLabels" checked> Etiquetas de aristas</label>
-  <input id="search" placeholder="Buscar tabla... (Enter)"/>
-  <button id="fit">Ajustar</button>
-  <button id="relayout">Re-aplicar dagre</button>
-  <button id="reset">Reset</button>
-  <button id="savePos">Guardar posiciones</button>
-  <button id="loadPos">Cargar posiciones</button>
-  <button id="clearPos">Borrar posiciones</button>
-</div>
-
-<div id="layoutRow">
-  <div id="cy"></div>
-  <aside id="side">
-    <h3 id="sideTitle">Selecciona un nodo</h3>
-    <div class="muted">En Linaje: fuentes → destino de creación<br>En Pares: FROM → JOIN de la misma sentencia</div>
-    <div id="meta"></div>
+<header>
+  <div class=\"toolbar\">
+    <h1>__TITLE__</h1>
+    <label>Buscar: <input id=\"searchInput\" type=\"search\" placeholder=\"Nombre de tabla\" /></label>
+    <button id=\"searchGo\">Ir</button>
+    <button id=\"fitBtn\">Fit</button>
+    <button id=\"layoutBtn\">Re-aplicar layout</button>
+    <label><input type=\"checkbox\" id=\"toggleLabels\" checked class=\"edge-label-toggle\" /> Etiquetas de aristas</label>
+    <label><input type=\"checkbox\" id=\"toggleTemps\" checked /> Mostrar TMP/TEMP</label>
+    <label>Catálogo:
+      <select id=\"catalogFilter\">
+        <option value=\"__ALL__\">Todos</option>
+        __CATALOG_OPTIONS__
+      </select>
+    </label>
+    <button id=\"savePos\">Guardar pos</button>
+    <button id=\"loadPos\">Cargar pos</button>
+    <button id=\"clearPos\">Borrar pos</button>
+  </div>
+</header>
+<main>
+  <div id=\"cy\"></div>
+  <aside id=\"sidebar\">
+    <div id=\"nodeTitle\" class=\"section\"><h2>Selecciona un nodo</h2><p class=\"muted\">Haz clic en una tabla para ver su construcción y uso.</p></div>
+    <div id=\"creationSection\" class=\"section\"></div>
+    <div id=\"usageSection\" class=\"section\"></div>
   </aside>
-</div>
-
-<script src="https://unpkg.com/cytoscape@3.26.0/dist/cytoscape.min.js"></script>
-<script src="https://unpkg.com/dagre@0.8.5/dist/dagre.min.js"></script>
-<script src="https://unpkg.com/cytoscape-dagre@2.5.0/cytoscape-dagre.js"></script>
+</main>
+<script src=\"https://unpkg.com/cytoscape@3.26.0/dist/cytoscape.min.js\"></script>
+<script src=\"https://unpkg.com/dagre@0.8.5/dist/dagre.min.js\"></script>
+<script src=\"https://unpkg.com/cytoscape-dagre@2.5.0/cytoscape-dagre.js\"></script>
 <script>
-const NODES   = __NODES__;
-const EDGES   = __EDGES__;
-const IN_L    = __IN_L__;
-const OUT_L   = __OUT_L__;
-const IN_P    = __IN_P__;
-const OUT_P   = __OUT_P__;
+const ELEMENT_NODES = __NODES_JSON__;
+const ELEMENT_EDGES = __EDGES_JSON__;
+const NODE_DETAILS = __NODE_DETAILS__;
+const LOCAL_STORAGE_KEY = 'sqlgraph_cyto_positions';
 
 cytoscape.use(cytoscapeDagre);
 
 const cy = cytoscape({
   container: document.getElementById('cy'),
-  elements: { nodes: NODES, edges: EDGES },
+  elements: {
+    nodes: ELEMENT_NODES,
+    edges: ELEMENT_EDGES,
+  },
   wheelSensitivity: 0.2,
   style: [
-    // nodos
-    { selector: 'node', style: {
+    {
+      selector: 'node',
+      style: {
         'shape': 'round-rectangle',
-        'width': 'label',
-        'height': 'label',
-        'padding': '6px',
-        'background-color': 'data(color)',
-        'border-color': '#0f172a', 'border-width': 1,
+        'background-color': '#1f2937',
+        'border-color': '#334155',
+        'border-width': 2,
+        'color': '#ffffff',
         'label': 'data(label)',
-        'font-size': 12, 'color':'#ffffff',
-        'text-outline-color':'#0b1220','text-outline-width':2,
-        'text-wrap':'wrap','text-max-width':260,
-        'text-valign':'center','text-halign':'center',
-        'min-zoomed-font-size':8
-    }},
-    { selector: 'node.tmp',  style: { 'border-color':'#10b981', 'border-width':3 } },
-    { selector: 'node.base', style: { } },
-
-    // aristas (estilo base)
-    { selector: 'edge', style: {
-        'curve-style':'bezier',
-        'target-arrow-shape':'triangle',
-        'line-color':'#94a3b8',
-        'target-arrow-color':'#94a3b8',
+        'text-outline-color': '#0b1120',
+        'text-outline-width': 3,
+        'text-wrap': 'wrap',
+        'text-max-width': 220,
+        'padding': '8px',
+        'font-size': 12,
+        'min-zoomed-font-size': 8,
+        'text-valign': 'center',
+        'text-halign': 'center',
+      }
+    },
+    {
+      selector: 'node.tmp',
+      style: {
+        'border-color': '#10b981',
+        'border-width': 3,
+      }
+    },
+    {
+      selector: 'edge',
+      style: {
+        'curve-style': 'bezier',
+        'target-arrow-shape': 'triangle',
+        'target-arrow-color': '#94a3b8',
+        'line-color': '#94a3b8',
         'width': 2,
-        'label': 'data(showLabel)',
-        'font-size': 11, 'color':'#ffffff',
-        'text-outline-color':'#0b1220','text-outline-width':2,
-        'text-rotation':'autorotate',
-        'text-background-opacity':0.35,
-        'text-background-color':'#0b1220',
-        'text-background-shape':'round-rectangle',
-        'text-background-padding':'2px',
-        'min-zoomed-font-size':8,
-        'text-wrap':'wrap','text-max-width':200,
-        'text-margin-y': -6
-    }},
-    // clases por tipo de join
-    { selector:'edge.join-left',  style:{ 'line-style':'dashed','line-dash-pattern':[6,4], 'line-color':'#059669','target-arrow-color':'#059669' } },
-    { selector:'edge.join-right', style:{ 'line-style':'dashed','line-dash-pattern':[2,6], 'line-color':'#d97706','target-arrow-color':'#d97706' } },
-    { selector:'edge.join-full',  style:{ 'line-style':'dashed','line-dash-pattern':[1,3], 'width':3, 'line-color':'#dc2626','target-arrow-color':'#dc2626' } },
-    { selector:'edge.join-inner', style:{ 'width':3, 'line-color':'#2563eb','target-arrow-color':'#2563eb' } },
-    { selector:'edge.join-cross', style:{ 'line-style':'dashed','line-dash-pattern':[8,2], 'line-color':'#7c3aed','target-arrow-color':'#7c3aed' } },
-    { selector:'edge.join-from',  style:{ 'line-color':'#9ca3af','target-arrow-color':'#9ca3af','width':1 } },
-
-    // visibilidad por modo
-    { selector:'edge.etype-lineage', style:{ 'display':'element' } },
-    { selector:'edge.etype-pair',    style:{ 'display':'none'    } },
-
-    // atenuado
-    { selector:'.faded', style:{ 'opacity':0.12 } }
+        'label': 'data(edgeLabel)',
+        'font-size': 11,
+        'color': '#ffffff',
+        'text-outline-color': '#0b1120',
+        'text-outline-width': 2,
+        'text-background-color': '#0b1120',
+        'text-background-opacity': 0.8,
+        'text-background-shape': 'round-rectangle',
+        'text-background-padding': '2px',
+        'text-rotation': 'autorotate',
+        'text-wrap': 'wrap',
+        'text-max-width': 240,
+        'min-zoomed-font-size': 8,
+      }
+    },
+    { selector: 'edge.edge-lineage', style: { 'line-color': '#9ca3af', 'target-arrow-color': '#9ca3af' } },
+    { selector: 'edge.edge-join', style: { 'target-arrow-color': '#9ca3af' } },
+    { selector: 'edge.edge-usage', style: {
+        'line-style': 'dashed',
+        'line-dash-pattern': [4,4],
+        'line-color': '#a78bfa',
+        'target-arrow-color': '#a78bfa',
+        'width': 2,
+      }
+    },
+    { selector: 'edge.join-left', style: {
+        'line-style': 'dashed',
+        'line-dash-pattern': [6,4],
+        'line-color': '#059669',
+        'target-arrow-color': '#059669',
+        'width': 2,
+      }
+    },
+    { selector: 'edge.join-right', style: {
+        'line-style': 'dashed',
+        'line-dash-pattern': [2,6],
+        'line-color': '#d97706',
+        'target-arrow-color': '#d97706',
+        'width': 2,
+      }
+    },
+    { selector: 'edge.join-inner', style: {
+        'line-color': '#2563eb',
+        'target-arrow-color': '#2563eb',
+        'width': 3,
+      }
+    },
+    { selector: 'edge.join-full', style: {
+        'line-style': 'dashed',
+        'line-dash-pattern': [1,3],
+        'line-color': '#dc2626',
+        'target-arrow-color': '#dc2626',
+        'width': 3,
+      }
+    },
+    { selector: 'edge.join-cross', style: {
+        'line-style': 'dashed',
+        'line-dash-pattern': [8,2],
+        'line-color': '#7c3aed',
+        'target-arrow-color': '#7c3aed',
+        'width': 2,
+      }
+    },
   ],
-  layout: { name:'dagre', rankDir:'LR', nodeSep:80, rankSep:120, edgeSep:20, padding:20 }
 });
 
-// --------- Controles ----------
-const modeSel   = document.getElementById('mode');
-const onlyTmp   = document.getElementById('onlyTmp');
-const edgeLbls  = document.getElementById('edgeLabels');
+function runLayout() {
+  cy.layout({ name: 'dagre', rankDir: 'LR', nodeSep: 120, rankSep: 100, edgeSep: 50 }).run();
+}
 
-document.getElementById('fit').onclick = () => cy.fit(null,30);
-document.getElementById('relayout').onclick = () => cy.layout({ name:'dagre', rankDir:'LR', nodeSep:80, rankSep:120 }).run();
+runLayout();
 
-document.getElementById('reset').onclick = () => {
-  cy.elements().removeClass('faded');
-  cy.nodes().forEach(n => n.style('display','element'));
-  applyMode();
-  applyOnlyTmp();
-  applyEdgeLabels();
-  cy.fit(null,30);
-};
+const searchInput = document.getElementById('searchInput');
+const searchButton = document.getElementById('searchGo');
+const fitButton = document.getElementById('fitBtn');
+const layoutButton = document.getElementById('layoutBtn');
+const toggleLabels = document.getElementById('toggleLabels');
+const toggleTemps = document.getElementById('toggleTemps');
+const catalogFilter = document.getElementById('catalogFilter');
+const savePos = document.getElementById('savePos');
+const loadPos = document.getElementById('loadPos');
+const clearPos = document.getElementById('clearPos');
+const nodeTitle = document.getElementById('nodeTitle');
+const creationSection = document.getElementById('creationSection');
+const usageSection = document.getElementById('usageSection');
 
-document.getElementById('savePos').onclick = () => {
-  const pos={}; cy.nodes().forEach(n => pos[n.id()] = n.position());
-  localStorage.setItem('sqlgraph_cyto_positions', JSON.stringify(pos));
+function showNodeDetails(node) {
+  if (!node) {
+    nodeTitle.innerHTML = '<h2>Selecciona un nodo</h2><p class="muted">Haz clic en una tabla para ver su construcción y uso.</p>';
+    creationSection.innerHTML = '';
+    usageSection.innerHTML = '';
+    return;
+  }
+  const data = node.data();
+  const details = NODE_DETAILS[data.id] || {};
+  const label = data.label;
+  nodeTitle.innerHTML = `<h2>${label}</h2>` + (data.isTmp ? '<span class="badge tmp">TMP/TEMP</span>' : '');
+
+  const creations = details.creations || (details.creation ? [details.creation] : []);
+  if (creations.length === 0) {
+    creationSection.innerHTML = '<h2>Creación</h2><p class="muted">Sin información de creación.</p>';
+  } else {
+    const items = creations.map((entry) => {
+      const joins = (entry.joins || []).map((j) => {
+        const joinKey = j.join_key ? ` · por ${j.join_key}` : '';
+        return `<li>${j.join_type}${joinKey}: ${j.table}</li>`;
+      }).join('') || '<li class="muted">Sin JOINs</li>';
+      const fromText = entry.from_main ? entry.from_main : '<span class="muted">Sin FROM principal</span>';
+      const fileText = entry.file ? `<div class="muted">${entry.kind} · ${entry.file}</div>` : `<div class="muted">${entry.kind || ''}</div>`;
+      return `<li><div><strong>FROM</strong>: ${fromText}</div><ul class="list">${joins}</ul>${fileText}</li>`;
+    }).join('');
+    creationSection.innerHTML = `<h2>Creación</h2><ul class="list">${items}</ul>`;
+  }
+
+  const consumers = details.consumers || [];
+  if (consumers.length === 0) {
+    usageSection.innerHTML = '<h2>Utilizado en</h2><p class="muted">Sin usos posteriores detectados.</p>';
+  } else {
+    const items = consumers.map((item) => `<li>${item.target}${item.kind ? ` · ${item.kind}` : ''}</li>`).join('');
+    usageSection.innerHTML = `<h2>Utilizado en</h2><ul class="list">${items}</ul>`;
+  }
+}
+
+function applyFilters() {
+  const showTemps = toggleTemps.checked;
+  const catalogValue = catalogFilter.value;
+  const visibleNodes = new Set();
+
+  cy.nodes().forEach((node) => {
+    const isTmp = node.data('isTmp') === 1;
+    const catalog = node.data('catalog');
+    const matchesCatalog = catalogValue === '__ALL__' || catalog === catalogValue;
+    const shouldShow = (!isTmp || showTemps) && matchesCatalog;
+    node.style('display', shouldShow ? 'element' : 'none');
+    if (shouldShow) {
+      visibleNodes.add(node.id());
+    }
+  });
+
+  cy.edges().forEach((edge) => {
+    const srcVisible = visibleNodes.has(edge.source().id());
+    const tgtVisible = visibleNodes.has(edge.target().id());
+    const shouldShow = srcVisible && tgtVisible;
+    edge.style('display', shouldShow ? 'element' : 'none');
+  });
+}
+
+toggleTemps.addEventListener('change', applyFilters);
+catalogFilter.addEventListener('change', applyFilters);
+
+function performSearch() {
+  const query = (searchInput.value || '').trim().toUpperCase();
+  if (!query) {
+    return;
+  }
+  const matches = cy.nodes().filter((node) => {
+    return node.data('label').toUpperCase().includes(query);
+  });
+  if (matches.length > 0) {
+    const target = matches[0];
+    cy.elements().unselect();
+    target.select();
+    cy.animate({ center: { eles: target }, duration: 250, easing: 'ease' });
+    showNodeDetails(target);
+  }
+}
+
+searchInput.addEventListener('keydown', (event) => {
+  if (event.key === 'Enter') {
+    performSearch();
+  }
+});
+searchButton.addEventListener('click', performSearch);
+
+fitButton.addEventListener('click', () => {
+  const visible = cy.elements().filter(':visible');
+  cy.fit(visible, 50);
+});
+
+layoutButton.addEventListener('click', () => {
+  runLayout();
+});
+
+toggleLabels.addEventListener('change', () => {
+  const show = toggleLabels.checked;
+  const style = cy.style();
+  style.selector('edge').style('label', show ? 'data(edgeLabel)' : '');
+  style.update();
+});
+
+savePos.addEventListener('click', () => {
+  const positions = {};
+  cy.nodes().forEach((node) => {
+    const pos = node.position();
+    positions[node.id()] = { x: pos.x, y: pos.y };
+  });
+  localStorage.setItem(LOCAL_STORAGE_KEY, JSON.stringify(positions));
   alert('Posiciones guardadas.');
-};
-document.getElementById('loadPos').onclick = () => {
-  const raw = localStorage.getItem('sqlgraph_cyto_positions');
-  if(!raw){ alert('No hay posiciones guardadas.'); return; }
-  const pos = JSON.parse(raw);
-  cy.nodes().forEach(n => { if(pos[n.id()]) n.position(pos[n.id()]); });
-  cy.fit(null,30);
-};
-document.getElementById('clearPos').onclick = () => {
-  localStorage.removeItem('sqlgraph_cyto_positions');
-  alert('Posiciones borradas.');
-};
-
-const search=document.getElementById('search');
-search.addEventListener('keydown', e=>{
-  if(e.key!=='Enter') return;
-  const q=(search.value||'').trim().toLowerCase();
-  if(!q) return;
-  const hit=cy.nodes().filter(n => (n.data('label')||'').toLowerCase().includes(q)).first();
-  if(hit){ cy.elements().removeClass('faded'); cy.center(hit); hit.select(); }
 });
 
-// switches
-modeSel.onchange = applyMode;
-onlyTmp.onchange = applyOnlyTmp;
-edgeLbls.onchange = applyEdgeLabels;
-
-function applyMode(){
-  const m = modeSel.value; // 'lineage' | 'pairs'
-  cy.edges('.etype-lineage').style('display', m==='lineage' ? 'element' : 'none');
-  cy.edges('.etype-pair').style('display',    m==='pairs'   ? 'element' : 'none');
-}
-function applyOnlyTmp(){
-  const showTmp = onlyTmp.checked;
-  cy.nodes().forEach(n => {
-    const isTmp = n.data('isTmp');
-    n.style('display', (showTmp && !isTmp) ? 'none' : 'element');
-  });
-}
-function applyEdgeLabels(){
-  const show = edgeLbls.checked;
-  cy.edges().forEach(e => e.style('label', show ? e.data('showLabel') : ''));
-}
-applyMode(); applyOnlyTmp(); applyEdgeLabels();
-
-// Panel lateral + enfoque
-const sideTitle=document.getElementById('sideTitle');
-const meta=document.getElementById('meta');
-
-function tmpBadgeFor(id){
-  const el = cy.getElementById(id);
-  if(el && el.length && el.data('isTmp')){
-    return ' <span class="pill pill-tmp">TMP</span>';
+loadPos.addEventListener('click', () => {
+  const raw = localStorage.getItem(LOCAL_STORAGE_KEY);
+  if (!raw) {
+    alert('No hay posiciones guardadas.');
+    return;
   }
-  return '';
-}
-
-function renderDetails(id){
-  const mode = modeSel.value;
-  const node = cy.getElementById(id);
-  const isTmpNode = !!(node && node.length && node.data('isTmp'));
-  let inc = [], out = [];
-  if(mode==='lineage'){ inc = IN_L[id] || []; out = OUT_L[id] || []; }
-  else                { inc = IN_P[id] || []; out = OUT_P[id] || []; }
-
-  let html='';
-  if(mode==='lineage' && isTmpNode){
-    const tmpUsages = out.filter(row => {
-      const target = row[0];
-      const targetEl = cy.getElementById(target);
-      return targetEl && targetEl.length && targetEl.data('isTmp');
-    }).length;
-    const otherUsages = out.length - tmpUsages;
-    if(out.length){
-      html+=`<div class="tmpSummary">Utilizada en ${out.length} tabla(s): ${tmpUsages} temporales · ${otherUsages} permanentes.</div>`;
-    }else{
-      html+=`<div class="tmpSummary muted">Esta tabla temporal no es utilizada posteriormente.</div>`;
-    }
-  }
-  html+=`<h4>Entrantes (${inc.length})</h4>`;
-  if(inc.length===0) html+=`<div class="muted">—</div>`;
-  inc.forEach(row => {
-    if(mode==='lineage'){
-      const [src,j,op,f]=row;
-      html+=`<div class="pill">${j}</div> ${src}${tmpBadgeFor(src)} <span class="muted">· ${op} @ ${f}</span><br/>`;
-    }else{
-      const [src,j,f]=row;
-      html+=`<div class="pill">${j}</div> ${src}${tmpBadgeFor(src)} <span class="muted">· ${f}</span><br/>`;
-    }
-  });
-  const outTitle = (mode==='lineage' && isTmpNode) ? 'Utilizado en' : 'Salientes';
-  html+=`<h4 style="margin-top:.8rem">${outTitle} (${out.length})</h4>`;
-  if(out.length===0) html+=`<div class="muted">—</div>`;
-  out.forEach(row => {
-    if(mode==='lineage'){
-      const [dst,j,op,f]=row;
-      html+=`<div class="pill">${j}</div> ${dst}${tmpBadgeFor(dst)} <span class="muted">· ${op} @ ${f}</span><br/>`;
-    }else{
-      const [dst,j,f]=row;
-      html+=`<div class="pill">${j}</div> ${dst}${tmpBadgeFor(dst)} <span class="muted">· ${f}</span><br/>`;
-    }
-  });
-  meta.innerHTML = html;
-}
-
-cy.on('tap','node', evt=>{
-  const n=evt.target;
-  sideTitle.textContent=n.data('label');
-  renderDetails(n.id());
-  cy.elements().addClass('faded'); n.closedNeighborhood().removeClass('faded');
-});
-cy.on('tap', evt=>{
-  if(evt.target===cy){
-    cy.elements().removeClass('faded');
-    sideTitle.textContent='Selecciona un nodo'; meta.innerHTML='';
+  try {
+    const saved = JSON.parse(raw);
+    cy.nodes().forEach((node) => {
+      if (saved[node.id()]) {
+        node.position(saved[node.id()]);
+      }
+    });
+  } catch (err) {
+    console.error(err);
   }
 });
 
-// Ajuste inicial
-cy.fit(null, 30);
+clearPos.addEventListener('click', () => {
+  localStorage.removeItem(LOCAL_STORAGE_KEY);
+  alert('Posiciones eliminadas.');
+});
+
+cy.on('tap', 'node', (event) => {
+  const node = event.target;
+  cy.elements().unselect();
+  node.select();
+  showNodeDetails(node);
+});
+
+cy.on('tap', (event) => {
+  if (event.target === cy) {
+    cy.elements().unselect();
+    showNodeDetails(null);
+  }
+});
+
+applyFilters();
 </script>
 </body>
-</html>"""
+</html>
+"""
 
-    html = (template
-            .replace("__TITLE__", title)
-            .replace("__NODES__", json.dumps(cy_nodes, ensure_ascii=False))
-            .replace("__EDGES__", json.dumps(cy_edges, ensure_ascii=False))
-            .replace("__IN_L__", json.dumps(incomingL, ensure_ascii=False))
-            .replace("__OUT_L__", json.dumps(outgoingL, ensure_ascii=False))
-            .replace("__IN_P__", json.dumps(incomingP, ensure_ascii=False))
-            .replace("__OUT_P__", json.dumps(outgoingP, ensure_ascii=False)))
+
+def build_html(
+    nodes: Sequence[dict],
+    edges_lineage: Sequence[tuple],
+    edges_pairs: Sequence[tuple],
+    edges_usage: Sequence[tuple],
+    title: str,
+) -> str:
+    """Return an interactive HTML page rendering the SQL lineage graph."""
+
+    def node_entry(node: dict) -> dict:
+        classes = []
+        if node.get("isTmp"):
+            classes.append("tmp")
+        return {
+            "data": {
+                "id": node["id"],
+                "label": node["label"],
+                "isTmp": int(bool(node.get("isTmp"))),
+                "catalog": node.get("catalog"),
+                "schema": node.get("schema"),
+                "table_name": node.get("table_name"),
+            },
+            "classes": " ".join(classes),
+        }
+
+    def lineage_entry(idx: int, src: str, dst: str, op: str, file: str) -> dict:
+        return {
+            "data": {
+                "id": f"lineage-{idx}",
+                "source": src,
+                "target": dst,
+                "edgeLabel": op,
+                "kind": "lineage",
+                "file": file,
+            },
+            "classes": "edge-lineage",
+        }
+
+    def join_label(join_type: str, join_key: str | None) -> str:
+        base = (join_type or "").upper()
+        if join_key:
+            return f"{base} · por {join_key}"
+        return base
+
+    def join_entry(idx: int, src: str, dst: str, join_type: str, join_key: str | None, file: str) -> dict:
+        jt = (join_type or "INNER").upper()
+        classes = ["edge-join"]
+        match jt:
+            case "LEFT":
+                classes.append("join-left")
+            case "RIGHT":
+                classes.append("join-right")
+            case "FULL":
+                classes.append("join-full")
+            case "INNER" | "JOIN":
+                classes.append("join-inner")
+            case "CROSS":
+                classes.append("join-cross")
+            case _:
+                classes.append("join-inner")
+        return {
+            "data": {
+                "id": f"join-{idx}",
+                "source": src,
+                "target": dst,
+                "edgeLabel": join_label(jt, join_key),
+                "kind": "join",
+                "joinType": jt,
+                "joinKey": join_key,
+                "file": file,
+            },
+            "classes": " ".join(classes),
+        }
+
+    def usage_entry(idx: int, src: str, dst: str, op: str, file: str) -> dict:
+        return {
+            "data": {
+                "id": f"usage-{idx}",
+                "source": src,
+                "target": dst,
+                "edgeLabel": op,
+                "kind": "usage",
+                "file": file,
+            },
+            "classes": "edge-usage",
+        }
+
+    cy_nodes = [node_entry(node) for node in nodes]
+    lineage_edges = [
+        lineage_entry(idx, src, dst, op, file)
+        for idx, (src, dst, op, file) in enumerate(edges_lineage)
+    ]
+    join_edges = [
+        join_entry(idx, src, dst, join_type, join_key, file)
+        for idx, (src, dst, join_type, join_key, file) in enumerate(edges_pairs)
+    ]
+    usage_edges = [
+        usage_entry(idx, src, dst, op, file)
+        for idx, (src, dst, op, file) in enumerate(edges_usage)
+    ]
+
+    node_details = {
+        node["id"]: {
+            k: v for k, v in node.items() if k not in {"id", "label", "isTmp", "catalog", "schema", "table_name"}
+        }
+        for node in nodes
+    }
+
+    catalogs = sorted({node["catalog"] for node in nodes if node.get("catalog")})
+    catalog_options = "".join(f'<option value="{c}">{c}</option>' for c in catalogs)
+
+    nodes_json = json.dumps(cy_nodes, ensure_ascii=False)
+    edges_json = json.dumps(lineage_edges + join_edges + usage_edges, ensure_ascii=False)
+    node_details_json = json.dumps(node_details, ensure_ascii=False)
+
+    html = (
+        HTML_TEMPLATE
+        .replace("__TITLE__", title)
+        .replace("__CATALOG_OPTIONS__", catalog_options)
+        .replace("__NODES_JSON__", nodes_json)
+        .replace("__EDGES_JSON__", edges_json)
+        .replace("__NODE_DETAILS__", node_details_json)
+    )
     return html

@@ -1,163 +1,291 @@
 # -*- coding: utf-8 -*-
-"""
-make_sql_graph.py (compat)
-- Soporta parse_sql.parse_file() devolviendo:
-  * NUEVA API: dict con keys ["nodes","edges_lineage","edges_pairs","catalogs","statements"]
-  * API ANTIGUA: list[(source,target,op,file[,join_type])]
-- Genera HTML (Cytoscape) + CSVs.
-CLI:
-  python make_sql_graph.py --input PATH --output salida.html [--glob "*.sql"] [--default-catalog PROD_MODELOS]
-"""
+"""CLI to build the SQL lineage HTML graph and CSV extracts."""
+from __future__ import annotations
 
 import argparse
 import csv
+import json
+from collections import defaultdict
 from pathlib import Path
-from typing import List, Set, Tuple
+from typing import Dict, List, Sequence, Tuple
 
-from build_html_cyto import build_html, is_tmp
+from build_html_cyto import build_html
+from parse_sql import parse_file
 
-# importación del parser
-try:
-    from parse_sql import parse_file  # esperamos esta firma
-except Exception as e:
-    raise SystemExit(f"No pude importar parse_sql.parse_file: {e}")
 
-def _catalog_of(name: str) -> str:
-    try:
-        return name.split(".")[0] if "." in name else "(SIN CATALOGO)"
-    except Exception:
-        return "(SIN CATALOGO)"
+def _resolve_case_insensitive(path: Path) -> Path | None:
+    """Try to resolve a path ignoring case differences."""
 
-def gather(files: List[Path], default_catalog: str | None):
-    nodes: Set[str] = set()
-    edges_lineage: List[Tuple[str,str,str,str,str]] = []
-    edges_pairs:   List[Tuple[str,str,str,str]] = []
-    catalogs: Set[str] = set()
-    statements_all: List[str] = []
+    if path.exists():
+        return path
 
-    for f in files:
-        # Llamada compatible con ambas firmas (con/sin default_catalog)
+    parts = path.parts
+    if not parts:
+        return None
+
+    if path.is_absolute():
+        current = Path(parts[0])
+        index = 1
+    else:
+        current = Path('.')
+        index = 0
+
+    for idx in range(index, len(parts)):
+        segment = parts[idx]
         try:
-            res = parse_file(f, default_catalog=default_catalog)
-        except TypeError:
-            # parse_file antiguo sin default_catalog
-            res = parse_file(f)
+            candidates = list(current.iterdir())
+        except FileNotFoundError:
+            return None
+        except NotADirectoryError:
+            return None
+        match = None
+        for candidate in candidates:
+            if candidate.name.lower() == segment.lower():
+                match = candidate
+                break
+        if match is None:
+            return None
+        current = match
+    return current
 
-        # --- NUEVA API: dict ---
-        if isinstance(res, dict):
-            # nodes
-            if "nodes" in res:
-                nodes.update(res["nodes"])
-            # edges_lineage
-            if "edges_lineage" in res:
-                for row in res["edges_lineage"]:
-                    # (s,t,op,file,join_type)
-                    if isinstance(row, (list, tuple)):
-                        if len(row) >= 5:
-                            s,t,op,fi,jt = row[:5]
-                        elif len(row) == 4:
-                            s,t,op,fi = row; jt = ""
-                        else:
-                            continue
-                        edges_lineage.append((s,t,op,fi,jt))
-                        nodes.update((s,t))
-                        catalogs.update([_catalog_of(s), _catalog_of(t)])
-            # edges_pairs
-            if "edges_pairs" in res:
-                for row in res["edges_pairs"]:
-                    # (from_table, join_table, join_type, file)
-                    if isinstance(row, (list, tuple)) and len(row) >= 4:
-                        a,b,jt,fi = row[:4]
-                        edges_pairs.append((a,b,jt,fi))
-                        nodes.update((a,b))
-                        catalogs.update([_catalog_of(a), _catalog_of(b)])
-            # catalogs
-            if "catalogs" in res:
-                catalogs.update(res["catalogs"])
-            # statements
-            if "statements" in res:
-                statements_all.extend(res["statements"])
 
-        # --- API ANTIGUA: lista de aristas (asumimos linaje) ---
-        elif isinstance(res, (list, tuple)):
-            for row in res:
-                if not isinstance(row, (list, tuple)):
-                    continue
-                if len(row) >= 5:
-                    s,t,op,fi,jt = row[:5]
-                elif len(row) == 4:
-                    s,t,op,fi = row
-                    jt = ""
-                else:
-                    continue
-                edges_lineage.append((s,t,op,fi,jt))
-                nodes.update((s,t))
-                catalogs.update([_catalog_of(s), _catalog_of(t)])
-            # Aviso silencioso: no habrá edges_pairs ni statements
-        else:
-            # Formato desconocido: lo ignoramos sin romper
-            continue
+def _iter_sql_files(input_path: Path, pattern: str) -> List[Path]:
+    if input_path.is_file():
+        return [input_path]
+    return sorted(input_path.rglob(pattern))
 
-    return nodes, edges_lineage, edges_pairs, catalogs, statements_all
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--input", required=True, help="Archivo .sql o carpeta")
-    ap.add_argument("--output", required=True, help="HTML de salida")
-    ap.add_argument("--glob", default="*.sql", help="Patrón si --input es carpeta")
-    ap.add_argument("--default-catalog", default=None, help="Catálogo por defecto cuando falte SET CATALOG y/o calificador")
-    args = ap.parse_args()
+def _split_identifier(identifier: str) -> Tuple[str, str, str]:
+    parts = identifier.split('.')
+    if len(parts) >= 3:
+        return parts[-3], parts[-2], parts[-1]
+    if len(parts) == 2:
+        return '(SIN CATALOGO)', parts[0], parts[1]
+    if len(parts) == 1:
+        return '(SIN CATALOGO)', 'DBO', parts[0]
+    return '(SIN CATALOGO)', 'DBO', '?'
 
-    p = Path(args.input)
-    if not p.exists():
-        raise SystemExit(f"No existe: {p}")
 
-    files = sorted(p.rglob(args.glob)) if p.is_dir() else [p]
+def _is_temporal(table_name: str) -> bool:
+    upper = table_name.upper()
+    return 'TEMP' in upper or 'TMP' in upper
 
-    nodes, edges_lineage, edges_pairs, catalogs, statements = gather(files, args.default_catalog)
 
-    out_html = Path(args.output)
-    base = out_html.with_suffix("")
+def _prepare_node_payload(
+    node_id: str,
+    temporals: set[str],
+    creations_map: Dict[str, List[dict]],
+    consumers_map: Dict[str, List[dict]],
+) -> dict:
+    catalog, schema, table_name = _split_identifier(node_id)
+    return {
+        'id': node_id,
+        'label': node_id,
+        'isTmp': node_id in temporals or _is_temporal(table_name),
+        'catalog': catalog,
+        'schema': schema,
+        'table_name': table_name,
+        'creations': creations_map.get(node_id, []),
+        'consumers': consumers_map.get(node_id, []),
+    }
 
-    # CSV: nodes
-    with (base.parent / f"{base.name}.nodes.csv").open("w", newline="", encoding="utf-8") as fw:
-        w = csv.writer(fw)
-        w.writerow(["name", "is_tmp"])
-        for n in sorted(nodes):
-            w.writerow([n, "Y" if is_tmp(n) else "N"])
 
-    # CSV: edges_lineage (source -> target)
-    with (base.parent / f"{base.name}.edges_lineage.csv").open("w", newline="", encoding="utf-8") as fw:
-        w = csv.writer(fw)
-        w.writerow(["source", "target", "op", "file", "join_type"])
-        for row in edges_lineage:
-            w.writerow(row)
+def _aggregate_results(files: Sequence[Path], default_catalog: str) -> Dict[str, object]:
+    all_nodes: set[str] = set()
+    temporals: set[str] = set()
+    edges_lineage: List[Tuple[str, str, str, str]] = []
+    edges_pairs: List[Tuple[str, str, str, str | None, str]] = []
+    edges_usage: List[Tuple[str, str, str, str]] = []
+    catalogs: List[Tuple[str, int, str]] = []
+    statements: List[dict] = []
 
-    # CSV: edges_pairs (FROM -> JOIN)
-    with (base.parent / f"{base.name}.edges_pairs.csv").open("w", newline="", encoding="utf-8") as fw:
-        w = csv.writer(fw)
-        w.writerow(["from_table", "join_table", "join_type", "file"])
-        for row in edges_pairs:
-            w.writerow(row)
+    creations_map: Dict[str, List[dict]] = defaultdict(list)
+    consumers_map: Dict[str, List[dict]] = defaultdict(list)
 
-    # CSV: catalogs
-    with (base.parent / f"{base.name}.catalogs.csv").open("w", newline="", encoding="utf-8") as fw:
-        w = csv.writer(fw)
-        w.writerow(["catalog"])
-        for c in sorted(catalogs):
-            w.writerow([c])
+    for file_path in files:
+        result = parse_file(file_path, default_catalog=default_catalog)
+        file_nodes = set(result.get('nodes', []))
+        all_nodes.update(file_nodes)
+        temporals.update(result.get('temporals', []))
+        edges_lineage.extend(result.get('edges_lineage', []))
+        edges_pairs.extend(result.get('edges_pairs', []))
+        edges_usage.extend(result.get('edges_usage', []))
+        catalogs.extend(result.get('catalogs', []))
 
-    # HTML
-    html = build_html(nodes, edges_lineage, edges_pairs, "SQL Dependency Graph (Linaje / Pares JOIN)")
-    out_html.write_text(html, encoding="utf-8")
+        for stmt in result.get('statements', []):
+            statements.append(stmt)
+            creation_entry = {
+                'from_main': stmt.get('from_main'),
+                'joins': [
+                    {
+                        'table': join.get('table'),
+                        'join_type': (join.get('join_type') or '').upper(),
+                        'join_key': join.get('join_key'),
+                    }
+                    for join in stmt.get('joins', [])
+                ],
+                'kind': stmt.get('kind'),
+                'file': stmt.get('file'),
+            }
+            creations_map[stmt['target']].append(creation_entry)
 
-    print(f"OK: {out_html}")
-    print(f"OK: {(base.parent / (base.name + '.nodes.csv'))}")
-    print(f"OK: {(base.parent / (base.name + '.edges_lineage.csv'))}")
-    print(f"OK: {(base.parent / (base.name + '.edges_pairs.csv'))}")
-    print(f"OK: {(base.parent / (base.name + '.catalogs.csv'))}")
-    if not edges_lineage and not edges_pairs:
-        print("Aviso: no se detectaron dependencias (¿MERGE, SELECT INTO, funciones externas?).")
+            sources = []
+            if stmt.get('from_main'):
+                sources.append(stmt['from_main'])
+            for join in stmt.get('joins', []):
+                src_table = join.get('table')
+                if src_table:
+                    sources.append(src_table)
+            for source in sources:
+                consumers_map[source].append(
+                    {
+                        'target': stmt['target'],
+                        'kind': stmt.get('kind'),
+                        'file': stmt.get('file'),
+                    }
+                )
 
-if __name__ == "__main__":
+    edges_pairs = list(dict.fromkeys(edges_pairs))
+    edges_usage = list(dict.fromkeys(edges_usage))
+
+    for key, consumers in list(consumers_map.items()):
+        seen = set()
+        deduped = []
+        for consumer in consumers:
+            ident = (consumer.get('target'), consumer.get('kind'), consumer.get('file'))
+            if ident in seen:
+                continue
+            seen.add(ident)
+            deduped.append(consumer)
+        consumers_map[key] = deduped
+
+    nodes_payload = [
+        _prepare_node_payload(node_id, temporals, creations_map, consumers_map)
+        for node_id in sorted(all_nodes)
+    ]
+
+    return {
+        'nodes': nodes_payload,
+        'temporals': temporals,
+        'edges_lineage': edges_lineage,
+        'edges_pairs': edges_pairs,
+        'edges_usage': edges_usage,
+        'statements': statements,
+        'catalogs': catalogs,
+    }
+
+
+def _write_nodes_csv(path: Path, nodes: Sequence[dict]) -> None:
+    with path.open('w', newline='', encoding='utf-8') as fh:
+        writer = csv.writer(fh)
+        writer.writerow(['table', 'is_temp', 'catalog', 'schema', 'table_name'])
+        for node in nodes:
+            writer.writerow([
+                node['id'],
+                '1' if node.get('isTmp') else '0',
+                node.get('catalog'),
+                node.get('schema'),
+                node.get('table_name'),
+            ])
+
+
+def _write_edges_lineage_csv(path: Path, edges: Sequence[Tuple[str, str, str, str]]) -> None:
+    with path.open('w', newline='', encoding='utf-8') as fh:
+        writer = csv.writer(fh)
+        writer.writerow(['source', 'target', 'op', 'file'])
+        for src, dst, op, file in edges:
+            writer.writerow([src, dst, op, file])
+
+
+def _write_edges_pairs_csv(path: Path, edges: Sequence[Tuple[str, str, str, str | None, str]]) -> None:
+    with path.open('w', newline='', encoding='utf-8') as fh:
+        writer = csv.writer(fh)
+        writer.writerow(['src_from', 'dst_join', 'join_type', 'join_key', 'file'])
+        for src, dst, join_type, join_key, file in edges:
+            writer.writerow([src, dst, join_type, join_key or '', file])
+
+
+def _write_edges_usage_csv(path: Path, edges: Sequence[Tuple[str, str, str, str]]) -> None:
+    with path.open('w', newline='', encoding='utf-8') as fh:
+        writer = csv.writer(fh)
+        writer.writerow(['source', 'consumer', 'op', 'file'])
+        for src, dst, op, file in edges:
+            writer.writerow([src, dst, op, file])
+
+
+def _write_statements_csv(path: Path, statements: Sequence[dict]) -> None:
+    with path.open('w', newline='', encoding='utf-8') as fh:
+        writer = csv.writer(fh)
+        writer.writerow(['id_stmt', 'file', 'target', 'kind', 'from_main', 'joins_json'])
+        for index, stmt in enumerate(statements, start=1):
+            joins_json = json.dumps(stmt.get('joins', []), ensure_ascii=False)
+            writer.writerow([
+                index,
+                stmt.get('file'),
+                stmt.get('target'),
+                stmt.get('kind'),
+                stmt.get('from_main') or '',
+                joins_json,
+            ])
+
+
+def _write_catalogs_csv(path: Path, catalogs: Sequence[Tuple[str, int, str]]) -> None:
+    with path.open('w', newline='', encoding='utf-8') as fh:
+        writer = csv.writer(fh)
+        writer.writerow(['file', 'lineno', 'catalog'])
+        for file, lineno, catalog in catalogs:
+            writer.writerow([file, lineno, catalog])
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description='Genera un grafo HTML/CSV a partir de scripts SQL.')
+    parser.add_argument('--input', required=True, help='Archivo SQL o carpeta con scripts.')
+    parser.add_argument('--output', required=True, help='Ruta del HTML de salida.')
+    parser.add_argument('--glob', default='*.sql', help='Patrón glob cuando --input es carpeta.')
+    parser.add_argument('--default-catalog', required=True, help='Catálogo por defecto cuando no hay SET CATALOG.')
+    args = parser.parse_args()
+
+    input_path = Path(args.input)
+    resolved_input = _resolve_case_insensitive(input_path)
+    if resolved_input is None or not resolved_input.exists():
+        raise SystemExit(f'No existe la ruta de entrada: {input_path}')
+    input_path = resolved_input
+
+    files = _iter_sql_files(input_path, args.glob)
+    if not files:
+        raise SystemExit('No se encontraron archivos SQL para procesar.')
+
+    aggregated = _aggregate_results(files, args.default_catalog)
+    nodes = aggregated['nodes']
+
+    output_html = Path(args.output)
+    output_html.parent.mkdir(parents=True, exist_ok=True)
+    base = output_html.with_suffix('')
+
+    _write_nodes_csv(base.parent / f'{base.name}.nodes.csv', nodes)
+    _write_edges_lineage_csv(base.parent / f'{base.name}.edges_lineage.csv', aggregated['edges_lineage'])
+    _write_edges_pairs_csv(base.parent / f'{base.name}.edges_pairs.csv', aggregated['edges_pairs'])
+    _write_edges_usage_csv(base.parent / f'{base.name}.edges_usage.csv', aggregated['edges_usage'])
+    _write_statements_csv(base.parent / f'{base.name}.statements.csv', aggregated['statements'])
+    _write_catalogs_csv(base.parent / f'{base.name}.catalogs.csv', aggregated['catalogs'])
+
+    html = build_html(
+        nodes,
+        aggregated['edges_lineage'],
+        aggregated['edges_pairs'],
+        aggregated['edges_usage'],
+        f'SQL Graph - {base.name}',
+    )
+    output_html.write_text(html, encoding='utf-8')
+
+    print(f'OK: {output_html}')
+    print(f'OK: {base.parent / (base.name + ".nodes.csv")}')
+    print(f'OK: {base.parent / (base.name + ".edges_lineage.csv")}')
+    print(f'OK: {base.parent / (base.name + ".edges_pairs.csv")}')
+    print(f'OK: {base.parent / (base.name + ".edges_usage.csv")}')
+    print(f'OK: {base.parent / (base.name + ".statements.csv")}')
+    print(f'OK: {base.parent / (base.name + ".catalogs.csv")}')
+
+
+if __name__ == '__main__':
     main()
