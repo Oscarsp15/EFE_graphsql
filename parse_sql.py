@@ -1,245 +1,307 @@
 # -*- coding: utf-8 -*-
-"""
-parse_sql.py
-- Lee SET CATALOG <CAT>; y mantiene un catálogo actual.
-- Cualquier objeto no calificado (sin catálogo) se califica con el catálogo actual.
-- Normaliza nombres a: CATALOG.SCHEMA.TABLE (todo MAYÚSCULAS). Si falta schema, usa DBO.
-- Devuelve aristas (source, target, op, file, join_type) con 5 campos.
-"""
+"""Utilities to parse SQL lineage information for graph generation."""
+from __future__ import annotations
 
 import re
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Tuple, Set
+from typing import Dict, List, Optional, Set, Tuple
 
-IDENT = r'[A-Z0-9_$."-]+'
+# Regular expressions reused across the parser
+_IDENT_CHARS = r"[A-Z0-9_\.$\"-]"
+_TARGET_IDENT = rf"{_IDENT_CHARS}+"
 
-# Targets
-CREATE_TABLE_TARGET = re.compile(
-    rf"\bCREATE\s+(?:OR\s+REPLACE\s+)?(?:(?:TEMP|TEMPORARY)\s+)?TABLE\s+({IDENT})\b",
+_CREATE_TABLE_RE = re.compile(
+    rf"\bCREATE\s+(?:OR\s+REPLACE\s+)?((?:TEMP|TEMPORARY)\s+)?TABLE\s+({_TARGET_IDENT})",
     flags=re.IGNORECASE,
 )
-CREATE_VIEW_TARGET = re.compile(
-    rf"\bCREATE\s+(?:OR\s+REPLACE\s+)?VIEW\s+({IDENT})\b",
+_CREATE_VIEW_RE = re.compile(
+    rf"\bCREATE\s+(?:OR\s+REPLACE\s+)?VIEW\s+({_TARGET_IDENT})",
     flags=re.IGNORECASE,
 )
-INSERT_TARGET = re.compile(
-    rf"\bINSERT\s+INTO\s+({IDENT})\b",
+_INSERT_INTO_RE = re.compile(
+    rf"\bINSERT\s+INTO\s+({_TARGET_IDENT})",
     flags=re.IGNORECASE,
 )
-
-# Fuentes con tipo
-FROM_JOIN_WITH_TYPE = re.compile(
-    rf"\b((?:FROM)|(?:(?:LEFT|RIGHT|FULL|INNER|CROSS)\s+JOIN)|(?:JOIN))\s+({IDENT})\b",
+_FROM_RE = re.compile(
+    rf"\bFROM\s+({_TARGET_IDENT})(?:\s+(?:AS\s+)?({_TARGET_IDENT}))?",
     flags=re.IGNORECASE,
 )
+_JOIN_RE = re.compile(
+    rf"\b(LEFT|RIGHT|FULL|INNER|CROSS)?\s*JOIN\s+({_TARGET_IDENT})(?:\s+(?:AS\s+)?({_TARGET_IDENT}))?(?:\s+ON\s+(.*?))?(?=\b(?:LEFT|RIGHT|FULL|INNER|CROSS)\s+JOIN\b|\bJOIN\b|\bWHERE\b|\bGROUP\b|\bORDER\b|\bHAVING\b|\bUNION\b|\bEXCEPT\b|\bINTERSECT\b|\bLIMIT\b|\bQUALIFY\b|$)",
+    flags=re.IGNORECASE | re.DOTALL,
+)
+_SET_CATALOG_RE = re.compile(r"\bSET\s+CATALOG\s+([A-Z0-9_]+)\b", flags=re.IGNORECASE)
+_WITH_HEADER_RE = re.compile(r"\bWITH\b(.*?)\bSELECT\b", flags=re.IGNORECASE | re.DOTALL)
+_CTE_NAME_RE = re.compile(rf"\b({_TARGET_IDENT})\s+AS\s*\(", flags=re.IGNORECASE)
+_ON_KEY_RE = re.compile(rf"({_IDENT_CHARS}+?)\s*=\s*({_IDENT_CHARS}+?)", flags=re.IGNORECASE)
 
-# CTEs
-WITH_CTE_HEADER = re.compile(r"\bWITH\b(.*?)\bSELECT\b", flags=re.IGNORECASE | re.DOTALL)
-CTE_NAME = re.compile(rf"\b({IDENT})\s+AS\s*\(", flags=re.IGNORECASE)
 
-# SET CATALOG
-SET_CATALOG = re.compile(r"\bSET\s+CATALOG\s+([A-Z0-9_]+)\b", flags=re.IGNORECASE)
+@dataclass
+class JoinInfo:
+    """Information about a JOIN used while creating a target."""
 
-RESERVED = {
-    'SELECT','FROM','JOIN','WHERE','GROUP','ORDER','BY','ON','UNION','ALL','WITH','AS',
-    'INSERT','INTO','CREATE','TABLE','VIEW','VALUES','LEFT','RIGHT','FULL','INNER','OUTER',
-    'CROSS','LATERAL','LIMIT','OFFSET','HAVING','DISTINCT'
-}
+    table: str
+    join_type: str
+    join_key: Optional[str]
 
-def read_sql(path: Path) -> str:
-    txt = path.read_text(encoding='utf-8', errors='ignore')
-    txt = re.sub(r"/\*.*?\*/", " ", txt, flags=re.DOTALL)          # /* ... */
-    txt = re.sub(r"(?m)\s*--.*?$", " ", txt)                       # -- ...
-    txt = re.sub(r"\s+", " ", txt)
-    return txt
 
-def split_statements(sql: str) -> List[str]:
-    return [s.strip() for s in sql.split(';') if s.strip()]
+@dataclass
+class StatementInfo:
+    """Metadata captured for a single SQL statement that produces a target."""
 
-def extract_cte_names(stmt: str) -> Set[str]:
-    names: Set[str] = set()
-    m = WITH_CTE_HEADER.search(stmt)
-    if not m:
-        return names
-    header = m.group(1)
-    for m2 in CTE_NAME.finditer(header):
-        n = m2.group(1).strip('"')
-        if n and n.upper() not in RESERVED:
-            names.add(n)
+    id_stmt: int
+    file: str
+    target: str
+    kind: str
+    from_main: Optional[str]
+    joins: List[JoinInfo]
+
+    def to_dict(self) -> Dict[str, object]:
+        return {
+            "id_stmt": self.id_stmt,
+            "file": self.file,
+            "target": self.target,
+            "kind": self.kind,
+            "from_main": self.from_main,
+            "joins": [join.__dict__ for join in self.joins],
+        }
+
+
+def _strip_comments(path: Path) -> Tuple[str, List[Tuple[int, str]]]:
+    """Remove SQL comments while tracking SET CATALOG line numbers."""
+
+    text = path.read_text(encoding="utf-8", errors="ignore")
+    sanitized_lines: List[str] = []
+    catalog_hits: List[Tuple[int, str]] = []
+    in_block = False
+
+    for lineno, raw_line in enumerate(text.splitlines(), start=1):
+        line = raw_line
+        i = 0
+        cleaned = []
+        while i < len(line):
+            if not in_block and line.startswith("/*", i):
+                in_block = True
+                i += 2
+                continue
+            if in_block:
+                end = line.find("*/", i)
+                if end == -1:
+                    # comment continues in next line
+                    i = len(line)
+                    continue
+                in_block = False
+                i = end + 2
+                continue
+            if line.startswith("--", i):
+                break
+            cleaned.append(line[i])
+            i += 1
+        cleaned_line = "".join(cleaned)
+        sanitized_lines.append(cleaned_line)
+        if not in_block:
+            match = _SET_CATALOG_RE.search(cleaned_line)
+            if match:
+                catalog_hits.append((lineno, match.group(1).upper()))
+
+    sanitized = "\n".join(sanitized_lines)
+    sanitized = re.sub(r"\s+", " ", sanitized)
+    return sanitized, catalog_hits
+
+
+def _split_statements(sql: str) -> List[str]:
+    return [stmt.strip() for stmt in sql.split(";") if stmt.strip()]
+
+
+def _extract_cte_names(stmt: str) -> Set[str]:
+    header_match = _WITH_HEADER_RE.search(stmt)
+    if not header_match:
+        return set()
+    header = header_match.group(1)
+    names = set()
+    for match in _CTE_NAME_RE.finditer(header):
+        candidate = match.group(1).strip('"')
+        if candidate:
+            names.add(candidate.upper())
     return names
 
-def norm_part(p: str) -> str:
-    # quita comillas y normaliza a MAYÚSCULAS
-    return p.strip().strip('"').upper()
 
-def qualify(name: str, current_catalog: str | None, default_schema: str = "DBO") -> str:
-    """
-    Devuelve CATALOG.SCHEMA.TABLE.
-    name puede venir como:
-      - CATALOG.SCHEMA.TABLE
-      - SCHEMA.TABLE           (usa catálogo actual)
-      - TABLE                  (usa catálogo actual + DBO)
-    """
-    raw = name.strip()
-    parts = [norm_part(p) for p in raw.split('.') if p.strip()]
+def _normalize_part(part: str) -> str:
+    return part.strip().strip('"').upper()
 
-    if len(parts) >= 3:
-        cat, sch, tbl = parts[-3], parts[-2], parts[-1]
-        return f"{cat}.{sch}.{tbl}"
-    elif len(parts) == 2:
-        sch, tbl = parts[0], parts[1]
-        cat = (current_catalog or "").upper().strip() or "(SIN CATALOGO)"
-        return f"{cat}.{sch}.{tbl}"
-    elif len(parts) == 1:
-        tbl = parts[0]
-        cat = (current_catalog or "").upper().strip() or "(SIN CATALOGO)"
-        sch = default_schema.upper()
-        return f"{cat}.{sch}.{tbl}"
+
+def _qualify(name: str, current_catalog: str) -> str:
+    parts = [p for p in (piece.strip() for piece in name.split('.')) if p]
+    cleaned = [_normalize_part(part) for part in parts]
+    if len(cleaned) >= 3:
+        catalog, schema, table = cleaned[-3:]
+    elif len(cleaned) == 2:
+        schema, table = cleaned
+        catalog = current_catalog
+    elif len(cleaned) == 1:
+        (table,) = cleaned
+        schema = "DBO"
+        catalog = current_catalog
     else:
-        # fallback raro: devuelve como "(SIN CATALOGO).DBO.?"
-        cat = (current_catalog or "").upper().strip() or "(SIN CATALOGO)"
-        return f"{cat}.{default_schema.upper()}.?"
+        catalog, schema, table = current_catalog, "DBO", "?"
+    return f"{catalog}.{schema}.{table}"
 
-def classify_join(token: str) -> str:
-    t = token.upper()
-    if t.startswith("FROM"): return "FROM"
-    if "LEFT"  in t: return "LEFT"
-    if "RIGHT" in t: return "RIGHT"
-    if "FULL"  in t: return "FULL"
-    if "INNER" in t: return "INNER"
-    if "CROSS" in t: return "CROSS"
-    return "JOIN"
 
-def extract_sources(stmt: str, current_catalog: str | None) -> List[Tuple[str, str]]:
-    """
-    Devuelve [(fuente_ya_calificada, tipo_join)]
-    Excluye CTEs.
-    """
-    cte_names = {n.upper() for n in extract_cte_names(stmt)}
-    out: List[Tuple[str, str]] = []
-    for m in FROM_JOIN_WITH_TYPE.finditer(stmt):
-        token = m.group(1)
-        raw = m.group(2)
-        base = raw.strip('"')
-        # si el token capturado es palabra reservada o es CTE, ignora
-        if base.upper() in RESERVED or base.upper() in cte_names:
+def _is_temporary(name: str) -> bool:
+    return "TEMP" in name.upper() or "TMP" in name.upper()
+
+
+def _extract_join_key(on_clause: Optional[str]) -> Optional[str]:
+    if not on_clause:
+        return None
+    match = _ON_KEY_RE.search(on_clause)
+    if not match:
+        return None
+    left = match.group(1).split('.')[-1].strip('"').upper()
+    right = match.group(2).split('.')[-1].strip('"').upper()
+    if left == right:
+        return left
+    return f"{left}={right}"
+
+
+def _statement_kind(stmt: str) -> Tuple[Optional[str], Optional[str]]:
+    table_match = _CREATE_TABLE_RE.search(stmt)
+    if table_match:
+        dest = table_match.group(2)
+        if table_match.group(1):
+            return "CREATE TEMP TABLE", dest
+        return "CREATE TABLE", dest
+    view_match = _CREATE_VIEW_RE.search(stmt)
+    if view_match:
+        return "CREATE VIEW", view_match.group(1)
+    insert_match = _INSERT_INTO_RE.search(stmt)
+    if insert_match:
+        return "INSERT INTO", insert_match.group(1)
+    set_match = _SET_CATALOG_RE.search(stmt)
+    if set_match:
+        return "SET CATALOG", set_match.group(1)
+    return None, None
+
+
+def _collect_sources(stmt: str, current_catalog: str) -> Tuple[Optional[str], List[JoinInfo]]:
+    cte_names = _extract_cte_names(stmt)
+    main_from: Optional[str] = None
+    joins: List[JoinInfo] = []
+
+    for match in _FROM_RE.finditer(stmt):
+        raw = match.group(1)
+        if raw.strip().startswith('('):
             continue
-        q = qualify(base, current_catalog)
-        out.append((q, classify_join(token)))
-    return out
+        base = raw.strip('"')
+        if base.upper() in cte_names:
+            continue
+        qualified = _qualify(base, current_catalog)
+        main_from = qualified
+        break
 
-def lineage_join_label(jtype: str) -> str:
-    """Normaliza el tipo de relación para el CSV de linaje.
+    if not main_from:
+        return None, []
 
-    La intención es diferenciar los orígenes directos (FROM) de las tablas
-    que simplemente se utilizan dentro de la construcción (LEFT/INNER/etc).
-    Para estas últimas devolvemos "UTILIZADO EN" para reflejar mejor que la
-    tabla participa en la construcción del objeto de destino.
-    """
-    jt = (jtype or "").upper()
-    if jt == "FROM":
-        return "FROM"
-    if not jt:
-        return ""
-    return "UTILIZADO EN"
-
-def _catalog_of(name: str) -> str:
-    try:
-        return name.split(".")[0]
-    except Exception:
-        return "(SIN CATALOGO)"
+    for match in _JOIN_RE.finditer(stmt):
+        raw_table = match.group(2)
+        if raw_table.strip().startswith('('):
+            continue
+        base = raw_table.strip('"')
+        upper = base.upper()
+        if upper in cte_names:
+            continue
+        qualified = _qualify(base, current_catalog)
+        join_type = match.group(1).upper() if match.group(1) else "INNER"
+        join_key = _extract_join_key(match.group(4))
+        joins.append(JoinInfo(table=qualified, join_type=join_type, join_key=join_key))
+    return main_from, joins
 
 
-def parse_file(path: Path, default_catalog: str | None = None) -> Dict[str, object]:
-    """
-    Parsea el archivo SQL respetando SET CATALOG.
-    Retorna un dict con llaves:
-      - "nodes": set de objetos involucrados
-      - "edges_lineage": [(source, target, op, file, join_type)]
-      - "edges_pairs":   [(from_table, join_table, join_type, file)]
-      - "catalogs": set de catálogos observados
-      - "statements": lista de sentencias normalizadas
-    """
-    sql = read_sql(path)
-    stmts = split_statements(sql)
+def parse_file(path: Path, default_catalog: str) -> Dict[str, object]:
+    """Parse a SQL file extracting lineage metadata."""
+
+    default_catalog = default_catalog.upper()
+    sanitized_sql, catalog_hits = _strip_comments(path)
+    statements = _split_statements(sanitized_sql)
 
     nodes: Set[str] = set()
-    catalogs: Set[str] = set()
-    edges_lineage: List[Tuple[str, str, str, str, str]] = []
-    edges_pairs: List[Tuple[str, str, str, str]] = []
-    stmts_out: List[str] = []
+    created: Set[str] = set()
+    temporals: Set[str] = set()
+    edges_lineage: List[Tuple[str, str, str, str]] = []
+    edges_pairs: List[Tuple[str, str, str, Optional[str], str]] = []
+    edges_usage: List[Tuple[str, str, str, str]] = []
+    statements_info: List[StatementInfo] = []
+    catalogs: List[Tuple[str, int, str]] = []
 
-    current_catalog = (default_catalog.upper() if default_catalog else None)
+    current_catalog = default_catalog
+    hit_index = 0
+    temp_known: Set[str] = set()
 
-    for s in stmts:
-        stmts_out.append(s)
-        # 1) SET CATALOG (actualiza contexto y continúa)
-        mset = SET_CATALOG.search(s)
-        if mset:
-            current_catalog = norm_part(mset.group(1))
+    stmt_counter = 0
+    for stmt in statements:
+        kind, dest_raw = _statement_kind(stmt)
+
+        if kind == "SET CATALOG" and dest_raw:
+            current_catalog = dest_raw.upper()
+            if hit_index < len(catalog_hits):
+                line_no, catalog_name = catalog_hits[hit_index]
+                hit_index += 1
+            else:
+                line_no, catalog_name = (0, current_catalog)
+            catalogs.append((str(path), line_no, catalog_name))
             continue
 
-        sources = extract_sources(s, current_catalog)
-        if sources:
-            for src, _ in sources:
-                nodes.add(src)
-                catalogs.add(_catalog_of(src))
-
-        # 2) CREATE TABLE ... AS SELECT ...
-        m_ct = CREATE_TABLE_TARGET.search(s)
-        if m_ct and re.search(r"\bAS\b.*?\bSELECT\b", s, flags=re.IGNORECASE | re.DOTALL):
-            target_raw = m_ct.group(1)
-            target = qualify(target_raw, current_catalog)
-            nodes.add(target)
-            catalogs.add(_catalog_of(target))
-            for (src, jtype) in sources:
-                edges_lineage.append(
-                    (src, target, "CREATE TABLE", path.name, lineage_join_label(jtype))
-                )
+        if not kind or not dest_raw:
             continue
 
-        # 3) CREATE VIEW ... AS SELECT ...
-        m_cv = CREATE_VIEW_TARGET.search(s)
-        if m_cv and re.search(r"\bAS\b.*?\bSELECT\b", s, flags=re.IGNORECASE | re.DOTALL):
-            target_raw = m_cv.group(1)
-            target = qualify(target_raw, current_catalog)
-            nodes.add(target)
-            catalogs.add(_catalog_of(target))
-            for (src, jtype) in sources:
-                edges_lineage.append(
-                    (src, target, "CREATE VIEW", path.name, lineage_join_label(jtype))
-                )
-            continue
+        qualified_target = _qualify(dest_raw, current_catalog)
+        stmt_counter += 1
 
-        # 4) INSERT INTO ... SELECT ...
-        m_it = INSERT_TARGET.search(s)
-        if m_it and re.search(r"\bSELECT\b", s, flags=re.IGNORECASE):
-            target_raw = m_it.group(1)
-            target = qualify(target_raw, current_catalog)
-            nodes.add(target)
-            catalogs.add(_catalog_of(target))
-            for (src, jtype) in sources:
-                edges_lineage.append(
-                    (src, target, "INSERT", path.name, lineage_join_label(jtype))
-                )
-            continue
+        main_from, joins = _collect_sources(stmt, current_catalog)
 
-        # Si la sentencia tiene múltiples fuentes (FROM + JOIN), arma pares
-        base = None
-        for src, jtype in sources:
-            if jtype.upper().startswith("FROM"):
-                base = src
-                break
-        if base:
-            for src, jtype in sources:
-                if src == base:
-                    continue
-                edges_pairs.append((base, src, jtype, path.name))
+        nodes.add(qualified_target)
+        created.add(qualified_target)
+        if _is_temporary(qualified_target.split('.')[-1]):
+            temporals.add(qualified_target)
+            temp_known.add(qualified_target)
 
-    return {
+        sources_for_usage: List[str] = []
+
+        if main_from:
+            nodes.add(main_from)
+            edges_lineage.append((main_from, qualified_target, "FROM", str(path)))
+            sources_for_usage.append(main_from)
+
+        for join in joins:
+            nodes.add(join.table)
+            if main_from:
+                edges_pairs.append((main_from, join.table, join.join_type, join.join_key, str(path)))
+            sources_for_usage.append(join.table)
+
+        for source in sources_for_usage:
+            if source in temp_known:
+                edges_usage.append((source, qualified_target, "UTILIZADO EN", str(path)))
+
+        statements_info.append(
+            StatementInfo(
+                id_stmt=stmt_counter,
+                file=str(path),
+                target=qualified_target,
+                kind=kind,
+                from_main=main_from,
+                joins=joins,
+            )
+        )
+
+    result: Dict[str, object] = {
         "nodes": nodes,
+        "created": created,
+        "temporals": temporals,
         "edges_lineage": edges_lineage,
         "edges_pairs": edges_pairs,
+        "edges_usage": edges_usage,
+        "statements": [info.to_dict() for info in statements_info],
         "catalogs": catalogs,
-        "statements": stmts_out,
     }
+    return result
