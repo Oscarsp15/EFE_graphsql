@@ -9,7 +9,7 @@ parse_sql.py
 
 import re
 from pathlib import Path
-from typing import List, Tuple, Set
+from typing import Dict, List, Tuple, Set
 
 IDENT = r'[A-Z0-9_$."-]+'
 
@@ -128,31 +128,57 @@ def extract_sources(stmt: str, current_catalog: str | None) -> List[Tuple[str, s
         out.append((q, classify_join(token)))
     return out
 
-def parse_file(path: Path, default_catalog: str | None = None) -> List[Tuple[str, str, str, str, str]]:
+def _catalog_of(name: str) -> str:
+    try:
+        return name.split(".")[0]
+    except Exception:
+        return "(SIN CATALOGO)"
+
+
+def parse_file(path: Path, default_catalog: str | None = None) -> Dict[str, object]:
     """
     Parsea el archivo SQL respetando SET CATALOG.
-    Retorna lista de aristas (source, target, op, file, join_type)
+    Retorna un dict con llaves:
+      - "nodes": set de objetos involucrados
+      - "edges_lineage": [(source, target, op, file, join_type)]
+      - "edges_pairs":   [(from_table, join_table, join_type, file)]
+      - "catalogs": set de catálogos observados
+      - "statements": lista de sentencias normalizadas
     """
     sql = read_sql(path)
     stmts = split_statements(sql)
-    edges: List[Tuple[str, str, str, str, str]] = []
+
+    nodes: Set[str] = set()
+    catalogs: Set[str] = set()
+    edges_lineage: List[Tuple[str, str, str, str, str]] = []
+    edges_pairs: List[Tuple[str, str, str, str]] = []
+    stmts_out: List[str] = []
 
     current_catalog = (default_catalog.upper() if default_catalog else None)
 
     for s in stmts:
+        stmts_out.append(s)
         # 1) SET CATALOG (actualiza contexto y continúa)
         mset = SET_CATALOG.search(s)
         if mset:
             current_catalog = norm_part(mset.group(1))
             continue
 
+        sources = extract_sources(s, current_catalog)
+        if sources:
+            for src, _ in sources:
+                nodes.add(src)
+                catalogs.add(_catalog_of(src))
+
         # 2) CREATE TABLE ... AS SELECT ...
         m_ct = CREATE_TABLE_TARGET.search(s)
         if m_ct and re.search(r"\bAS\b.*?\bSELECT\b", s, flags=re.IGNORECASE | re.DOTALL):
             target_raw = m_ct.group(1)
             target = qualify(target_raw, current_catalog)
-            for (src, jtype) in extract_sources(s, current_catalog):
-                edges.append((src, target, "CREATE TABLE", path.name, jtype))
+            nodes.add(target)
+            catalogs.add(_catalog_of(target))
+            for (src, jtype) in sources:
+                edges_lineage.append((src, target, "CREATE TABLE", path.name, jtype))
             continue
 
         # 3) CREATE VIEW ... AS SELECT ...
@@ -160,8 +186,10 @@ def parse_file(path: Path, default_catalog: str | None = None) -> List[Tuple[str
         if m_cv and re.search(r"\bAS\b.*?\bSELECT\b", s, flags=re.IGNORECASE | re.DOTALL):
             target_raw = m_cv.group(1)
             target = qualify(target_raw, current_catalog)
-            for (src, jtype) in extract_sources(s, current_catalog):
-                edges.append((src, target, "CREATE VIEW", path.name, jtype))
+            nodes.add(target)
+            catalogs.add(_catalog_of(target))
+            for (src, jtype) in sources:
+                edges_lineage.append((src, target, "CREATE VIEW", path.name, jtype))
             continue
 
         # 4) INSERT INTO ... SELECT ...
@@ -169,8 +197,28 @@ def parse_file(path: Path, default_catalog: str | None = None) -> List[Tuple[str
         if m_it and re.search(r"\bSELECT\b", s, flags=re.IGNORECASE):
             target_raw = m_it.group(1)
             target = qualify(target_raw, current_catalog)
-            for (src, jtype) in extract_sources(s, current_catalog):
-                edges.append((src, target, "INSERT", path.name, jtype))
+            nodes.add(target)
+            catalogs.add(_catalog_of(target))
+            for (src, jtype) in sources:
+                edges_lineage.append((src, target, "INSERT", path.name, jtype))
             continue
 
-    return edges
+        # Si la sentencia tiene múltiples fuentes (FROM + JOIN), arma pares
+        base = None
+        for src, jtype in sources:
+            if jtype.upper().startswith("FROM"):
+                base = src
+                break
+        if base:
+            for src, jtype in sources:
+                if src == base:
+                    continue
+                edges_pairs.append((base, src, jtype, path.name))
+
+    return {
+        "nodes": nodes,
+        "edges_lineage": edges_lineage,
+        "edges_pairs": edges_pairs,
+        "catalogs": catalogs,
+        "statements": stmts_out,
+    }
