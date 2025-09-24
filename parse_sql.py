@@ -128,6 +128,21 @@ def extract_sources(stmt: str, current_catalog: str | None) -> List[Tuple[str, s
         out.append((q, classify_join(token)))
     return out
 
+def lineage_join_label(jtype: str) -> str:
+    """Normaliza el tipo de relación para el CSV de linaje.
+
+    La intención es diferenciar los orígenes directos (FROM) de las tablas
+    que simplemente se utilizan dentro de la construcción (LEFT/INNER/etc).
+    Para estas últimas devolvemos "UTILIZADO EN" para reflejar mejor que la
+    tabla participa en la construcción del objeto de destino.
+    """
+    jt = (jtype or "").upper()
+    if jt == "FROM":
+        return "FROM"
+    if not jt:
+        return ""
+    return "UTILIZADO EN"
+
 def _catalog_of(name: str) -> str:
     try:
         return name.split(".")[0]
@@ -178,7 +193,9 @@ def parse_file(path: Path, default_catalog: str | None = None) -> Dict[str, obje
             nodes.add(target)
             catalogs.add(_catalog_of(target))
             for (src, jtype) in sources:
-                edges_lineage.append((src, target, "CREATE TABLE", path.name, jtype))
+                edges_lineage.append(
+                    (src, target, "CREATE TABLE", path.name, lineage_join_label(jtype))
+                )
             continue
 
         # 3) CREATE VIEW ... AS SELECT ...
@@ -189,7 +206,9 @@ def parse_file(path: Path, default_catalog: str | None = None) -> Dict[str, obje
             nodes.add(target)
             catalogs.add(_catalog_of(target))
             for (src, jtype) in sources:
-                edges_lineage.append((src, target, "CREATE VIEW", path.name, jtype))
+                edges_lineage.append(
+                    (src, target, "CREATE VIEW", path.name, lineage_join_label(jtype))
+                )
             continue
 
         # 4) INSERT INTO ... SELECT ...
@@ -200,7 +219,9 @@ def parse_file(path: Path, default_catalog: str | None = None) -> Dict[str, obje
             nodes.add(target)
             catalogs.add(_catalog_of(target))
             for (src, jtype) in sources:
-                edges_lineage.append((src, target, "INSERT", path.name, jtype))
+                edges_lineage.append(
+                    (src, target, "INSERT", path.name, lineage_join_label(jtype))
+                )
             continue
 
         # Si la sentencia tiene múltiples fuentes (FROM + JOIN), arma pares
